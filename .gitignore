@@ -1,0 +1,30 @@
+# Build output
+/build/
+
+# Compiled binaries and libraries
+*.so
+*.o
+*.a
+*.core
+
+# Test executables
+/plugins/nakama/tests/http_auth_test
+/plugins/nakama/tests/nakama_abi_test
+/plugins/nakama/tests/nakama_config_loader_test
+/plugins/nakama/tests/nakama_config_validation_test
+/plugins/nakama/tests/nakama_live_integration
+/plugins/nakama/tests/nakama_plugin_manager_test
+/plugins/nakama/tests/websocket_transport_test
+
+# CTest output
+**/Testing/
+
+# Historical snapshots and temporary alternatives
+*.pre*
+*.new
+*.bak
+/plugins/nakama/tests/backup_n1/
+/plugins/nakama/src/websocket_transport.audited.cpp
+
+# Logs
+*.log
