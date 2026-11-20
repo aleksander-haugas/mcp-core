@@ -93,7 +93,11 @@ typedef struct mcp_host_api {
 #define MCP_PLUGIN_ABI_VERSION_1_1 0x00010001u
 
 #define MCP_PLUGIN_EXT_ASYNC_MESSAGES 0x4D435001ULL
-#define MCP_PLUGIN_ASYNC_MESSAGES_VERSION 1u
+#define MCP_PLUGIN_ASYNC_MESSAGES_VERSION_1 1u
+#define MCP_PLUGIN_ASYNC_MESSAGES_VERSION_2 2u
+#define MCP_PLUGIN_AUTHENTICATED_MESSAGE_CONTEXT_VERSION_1 1u
+#define MCP_PLUGIN_ASYNC_MESSAGES_VERSION \
+    MCP_PLUGIN_ASYNC_MESSAGES_VERSION_1
 
 typedef struct mcp_async_messages_v1 {
     uint32_t struct_size;
@@ -134,6 +138,56 @@ typedef struct mcp_async_messages_v1 {
     );
 
 } mcp_async_messages_v1;
+
+/*
+ * Authenticated message metadata.
+ *
+ * Strings are borrowed and valid only during publish_authenticated().
+ * The host must copy them before returning.
+ */
+typedef struct mcp_authenticated_message_context {
+    uint32_t struct_size;
+    uint32_t version;
+    const char *transport_id;
+    const char *authenticated_principal;
+} mcp_authenticated_message_context;
+
+typedef struct mcp_async_messages_v2 {
+    uint32_t struct_size;
+    uint32_t version;
+
+    /* v1-compatible function prefix. */
+    mcp_plugin_status (*register_receiver)(
+        void *host_context,
+        void (*callback)(
+            void *user_data,
+            const uint8_t *data,
+            size_t data_size
+        ),
+        void *user_data,
+        void **subscription
+    );
+
+    mcp_plugin_status (*unregister_receiver)(
+        void *host_context,
+        void *subscription
+    );
+
+    mcp_plugin_status (*publish)(
+        void *host_context,
+        const uint8_t *data,
+        size_t data_size
+    );
+
+    mcp_plugin_status (*publish_authenticated)(
+        void *host_context,
+        const mcp_authenticated_message_context *context,
+        const uint8_t *data,
+        size_t data_size
+    );
+
+} mcp_async_messages_v2;
+
 
 /*
  * Optional extension lookup.

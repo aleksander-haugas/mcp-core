@@ -304,6 +304,7 @@ void AgentBus::receive(
 
         if (!state->accepting ||
             it == state->transports.end() ||
+            !it->second.ready ||
             it->second.stopping) {
             return;
         }

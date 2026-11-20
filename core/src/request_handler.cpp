@@ -437,7 +437,8 @@ std::string RequestHandler::handle_tools_list(
         );
     }
 
-    for (const RegisteredTool& registered : plugin_manager_.tools()) {
+    const auto registered_tools = plugin_manager_.tools_snapshot();
+    for (const RegisteredTool& registered : registered_tools) {
         std::string denial_reason;
 
         if (!authorization_policy_.authorize(
@@ -592,7 +593,8 @@ std::string RequestHandler::handle_tools_call(
 
     const RegisteredTool* registered_tool = nullptr;
 
-    for (const RegisteredTool& tool : plugin_manager_.tools()) {
+    const auto registered_tools = plugin_manager_.tools_snapshot();
+    for (const RegisteredTool& tool : registered_tools) {
         if (tool.name == tool_name) {
             registered_tool = &tool;
             break;

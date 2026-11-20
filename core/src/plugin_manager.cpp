@@ -93,6 +93,9 @@ struct PluginManager::AsyncState {
 
         Direction direction = Direction::TO_CORE;
         std::string plugin_id;
+        std::string transport_id;
+        std::string authenticated_principal;
+        bool authenticated = false;
         std::vector<std::uint8_t> data;
         std::shared_ptr<Subscription> subscription;
     };
@@ -108,17 +111,42 @@ struct PluginManager::AsyncState {
         std::shared_ptr<Subscription>
     > subscriptions;
 
-    PluginMessageHandler message_handler;
+    std::shared_ptr<PluginMessageHandler> message_handler;
+    std::shared_ptr<AuthenticatedPluginMessageHandler>
+        authenticated_message_handler;
+
     std::size_t active_core_callbacks = 0;
+    std::size_t active_authenticated_callbacks = 0;
+
     std::condition_variable core_callbacks_drained;
     bool core_handler_draining = false;
+    bool authenticated_handler_draining = false;
 
     bool stopping = false;
     bool prefer_core_queue = true;
     std::thread worker;
+    std::mutex worker_join_mutex;
+
+    inline static thread_local const AsyncState*
+        executing_worker = nullptr;
 
     inline static thread_local const Subscription*
         executing_subscription = nullptr;
+
+    struct WorkerExecutionGuard {
+        const AsyncState* previous;
+
+        explicit WorkerExecutionGuard(const AsyncState* state)
+            : previous(executing_worker)
+        {
+            executing_worker = state;
+        }
+
+        ~WorkerExecutionGuard()
+        {
+            executing_worker = previous;
+        }
+    };
 
     inline static thread_local const AsyncState*
         executing_core_handler = nullptr;
@@ -318,7 +346,7 @@ struct PluginManager::AsyncState {
 
         std::lock_guard<std::mutex> lock(mutex);
 
-        if (stopping || !host.accepting) {
+        if (stopping || !host.accepting || !host.ready) {
             return MCP_PLUGIN_ERROR;
         }
 
@@ -331,6 +359,96 @@ struct PluginManager::AsyncState {
             QueueItem item;
             item.direction = QueueItem::Direction::TO_CORE;
             item.plugin_id = host.plugin_id;
+
+            if (size != 0) {
+                item.data.assign(data, data + size);
+            }
+
+            to_core_queue.push_back(std::move(item));
+        } catch (...) {
+            return MCP_PLUGIN_ERROR;
+        }
+
+        available.notify_one();
+        return MCP_PLUGIN_OK;
+    }
+
+    mcp_plugin_status publish_authenticated(
+        HostContext& host,
+        const mcp_authenticated_message_context* context,
+        const uint8_t* data,
+        size_t size
+    )
+    {
+        if (context == nullptr ||
+            context->struct_size < sizeof(mcp_authenticated_message_context) ||
+            context->version != MCP_PLUGIN_AUTHENTICATED_MESSAGE_CONTEXT_VERSION_1 ||
+            context->transport_id == nullptr ||
+            context->authenticated_principal == nullptr ||
+            (data == nullptr && size != 0) ||
+            size > MAX_MESSAGE_SIZE) {
+            return MCP_PLUGIN_INVALID_ARGUMENT;
+        }
+
+        // Bound string reads before constructing std::string objects.
+        constexpr std::size_t MAX_TRANSPORT_ID = 64;
+        constexpr std::size_t MAX_PRINCIPAL_SIZE = 256;
+
+        std::size_t transport_length = 0;
+        while (transport_length <= MAX_TRANSPORT_ID &&
+               context->transport_id[transport_length] != '\0') {
+            ++transport_length;
+        }
+
+        std::size_t principal_length = 0;
+        while (principal_length <= MAX_PRINCIPAL_SIZE &&
+               context->authenticated_principal[principal_length] != '\0') {
+            ++principal_length;
+        }
+
+        if (transport_length == 0 ||
+            transport_length > MAX_TRANSPORT_ID ||
+            principal_length == 0 ||
+            principal_length > MAX_PRINCIPAL_SIZE) {
+            return MCP_PLUGIN_INVALID_ARGUMENT;
+        }
+
+        // Initial explicit policy: only Nakama may assert Nakama identity.
+        // Compare the bounded borrowed string without allocating.
+        if (host.plugin_id != "nakama" ||
+            transport_length != sizeof("nakama") - 1 ||
+            std::strncmp(
+                context->transport_id,
+                "nakama",
+                sizeof("nakama") - 1
+            ) != 0) {
+            return MCP_PLUGIN_PERMISSION_DENIED;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (stopping || !host.accepting || !host.ready) {
+            return MCP_PLUGIN_ERROR;
+        }
+
+        if (to_plugin_queue.size() + to_core_queue.size() >=
+            MAX_QUEUE_SIZE) {
+            return MCP_PLUGIN_NOT_SUPPORTED;
+        }
+
+        try {
+            QueueItem item;
+            item.direction = QueueItem::Direction::TO_CORE;
+            item.plugin_id = host.plugin_id;
+            item.transport_id.assign(
+                context->transport_id,
+                transport_length
+            );
+            item.authenticated_principal.assign(
+                context->authenticated_principal,
+                principal_length
+            );
+            item.authenticated = true;
 
             if (size != 0) {
                 item.data.assign(data, data + size);
@@ -427,7 +545,7 @@ struct PluginManager::AsyncState {
         return MCP_PLUGIN_OK;
     }
 
-    void stop_worker() noexcept
+    bool stop_worker() noexcept
     {
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -443,27 +561,82 @@ struct PluginManager::AsyncState {
 
         available.notify_all();
 
-        if (worker.joinable() &&
-            worker.get_id() != std::this_thread::get_id()) {
-            worker.join();
+        // The worker cannot join itself. Do not inspect the std::thread
+        // object from the worker because an external thread may be joining it.
+        if (executing_worker == this) {
+            return false;
         }
+
+        // Serialize external callers so only one thread accesses joinable()
+        // and join() at a time. The worker never acquires this mutex.
+        {
+            std::lock_guard<std::mutex> join_lock(worker_join_mutex);
+
+            if (worker.joinable()) {
+                try {
+                    worker.join();
+                } catch (...) {
+                    return false;
+                }
+            }
+        }
+
+        // The worker has exited. Release handler closures outside
+        // the mutex because their destructors may execute user code.
+        std::shared_ptr<PluginMessageHandler> old_handler;
+        std::shared_ptr<AuthenticatedPluginMessageHandler>
+            old_authenticated_handler;
+
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+
+            core_callbacks_drained.wait(lock, [this] {
+                return !core_handler_draining &&
+                    !authenticated_handler_draining;
+            });
+
+            old_handler.swap(message_handler);
+            old_authenticated_handler.swap(authenticated_message_handler);
+        }
+
+        old_handler.reset();
+        old_authenticated_handler.reset();
+
+        return true;
     }
 
     void run() noexcept
     {
+        WorkerExecutionGuard worker_guard(this);
+
         for (;;) {
             QueueItem item;
-            PluginMessageHandler handler;
+            std::shared_ptr<PluginMessageHandler> handler;
+            std::shared_ptr<AuthenticatedPluginMessageHandler>
+                authenticated_handler;
             bool dispatch_to_plugin = false;
 
             {
                 std::unique_lock<std::mutex> lock(mutex);
 
                 available.wait(lock, [this] {
-                    return stopping ||
-                        !to_plugin_queue.empty() ||
-                        (!to_core_queue.empty() &&
-                         static_cast<bool>(message_handler));
+                    if (stopping || !to_plugin_queue.empty()) {
+                        return true;
+                    }
+
+                    return std::any_of(
+                        to_core_queue.begin(),
+                        to_core_queue.end(),
+                        [this](const QueueItem& queued) {
+                            if (queued.authenticated) {
+                                return !authenticated_handler_draining &&
+                                    static_cast<bool>(authenticated_message_handler);
+                            }
+
+                            return !core_handler_draining &&
+                                static_cast<bool>(message_handler);
+                        }
+                    );
                 });
 
                 if (stopping) {
@@ -473,17 +646,42 @@ struct PluginManager::AsyncState {
                 const bool can_dispatch_plugin =
                     !to_plugin_queue.empty();
 
+                auto core_it = std::find_if(
+                    to_core_queue.begin(),
+                    to_core_queue.end(),
+                    [this](const QueueItem& queued) {
+                        if (queued.authenticated) {
+                            return !authenticated_handler_draining &&
+                                static_cast<bool>(authenticated_message_handler);
+                        }
+
+                        return !core_handler_draining &&
+                            static_cast<bool>(message_handler);
+                    }
+                );
+
                 const bool can_dispatch_core =
-                    !to_core_queue.empty() &&
-                    static_cast<bool>(message_handler);
+                    core_it != to_core_queue.end();
 
                 if (can_dispatch_core &&
                     (!can_dispatch_plugin || prefer_core_queue)) {
 
-                    item = std::move(to_core_queue.front());
-                    to_core_queue.pop_front();
+                    item = std::move(*core_it);
+                    to_core_queue.erase(core_it);
                     item.direction = QueueItem::Direction::TO_CORE;
                     prefer_core_queue = false;
+
+                    if (item.authenticated) {
+                        authenticated_handler = authenticated_message_handler;
+                        if (authenticated_handler) {
+                            ++active_authenticated_callbacks;
+                        }
+                    } else {
+                        handler = message_handler;
+                        if (handler) {
+                            ++active_core_callbacks;
+                        }
+                    }
 
                 } else if (can_dispatch_plugin) {
 
@@ -508,11 +706,6 @@ struct PluginManager::AsyncState {
 
                     ++item.subscription->active_callbacks;
                     dispatch_to_plugin = true;
-                } else {
-                    handler = message_handler;
-                    if (handler) {
-                        ++active_core_callbacks;
-                    }
                 }
             }
 
@@ -549,13 +742,46 @@ struct PluginManager::AsyncState {
                         item.subscription->drained.notify_all();
                     }
                 }
+            } else if (authenticated_handler) {
+                const AsyncState* previous_handler =
+                    executing_core_handler;
+                executing_core_handler = this;
+
+                AuthenticatedPluginMessage message;
+                message.plugin_id = std::move(item.plugin_id);
+                message.transport_id = std::move(item.transport_id);
+                message.authenticated_principal =
+                    std::move(item.authenticated_principal);
+                message.data = std::move(item.data);
+
+                try {
+                    (*authenticated_handler)(message);
+                } catch (...) {
+                    PluginManager::log_message(
+                        MCP_LOG_ERROR,
+                        message.plugin_id,
+                        "Exception in authenticated Core message handler"
+                    );
+                }
+
+                executing_core_handler = previous_handler;
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+
+                    if (active_authenticated_callbacks > 0) {
+                        --active_authenticated_callbacks;
+                    }
+
+                    core_callbacks_drained.notify_all();
+                }
             } else if (handler) {
                 const AsyncState* previous_handler =
                     executing_core_handler;
                 executing_core_handler = this;
 
                 try {
-                    handler(item.plugin_id, item.data);
+                    (*handler)(item.plugin_id, item.data);
                 } catch (...) {
                     PluginManager::log_message(
                         MCP_LOG_ERROR,
@@ -573,9 +799,7 @@ struct PluginManager::AsyncState {
                         --active_core_callbacks;
                     }
 
-                    if (active_core_callbacks == 0) {
-                        core_callbacks_drained.notify_all();
-                    }
+                    core_callbacks_drained.notify_all();
                 }
             }
         }
@@ -696,20 +920,34 @@ mcp_plugin_status PluginManager::host_get_extension(
         return MCP_PLUGIN_NOT_SUPPORTED;
     }
 
-    if (minimum_version > MCP_PLUGIN_ASYNC_MESSAGES_VERSION) {
-        return MCP_PLUGIN_NOT_SUPPORTED;
-    }
-
-    static const mcp_async_messages_v1 async_messages = {
+    static const mcp_async_messages_v1 async_messages_v1 = {
         sizeof(mcp_async_messages_v1),
-        MCP_PLUGIN_ASYNC_MESSAGES_VERSION,
+        MCP_PLUGIN_ASYNC_MESSAGES_VERSION_1,
         &PluginManager::host_register_receiver,
         &PluginManager::host_unregister_receiver,
         &PluginManager::host_publish
     };
 
-    *extension = &async_messages;
-    return MCP_PLUGIN_OK;
+    static const mcp_async_messages_v2 async_messages_v2 = {
+        sizeof(mcp_async_messages_v2),
+        MCP_PLUGIN_ASYNC_MESSAGES_VERSION_2,
+        &PluginManager::host_register_receiver,
+        &PluginManager::host_unregister_receiver,
+        &PluginManager::host_publish,
+        &PluginManager::host_publish_authenticated
+    };
+
+    if (minimum_version <= MCP_PLUGIN_ASYNC_MESSAGES_VERSION_1) {
+        *extension = &async_messages_v1;
+        return MCP_PLUGIN_OK;
+    }
+
+    if (minimum_version == MCP_PLUGIN_ASYNC_MESSAGES_VERSION_2) {
+        *extension = &async_messages_v2;
+        return MCP_PLUGIN_OK;
+    }
+
+    return MCP_PLUGIN_NOT_SUPPORTED;
 }
 
 mcp_plugin_status PluginManager::host_register_receiver(
@@ -734,12 +972,16 @@ mcp_plugin_status PluginManager::host_register_receiver(
         return MCP_PLUGIN_ERROR;
     }
 
-    return host->state->register_receiver(
-        *host,
-        callback,
-        user_data,
-        subscription
-    );
+    try {
+        return host->state->register_receiver(
+            *host,
+            callback,
+            user_data,
+            subscription
+        );
+    } catch (...) {
+        return MCP_PLUGIN_ERROR;
+    }
 }
 
 mcp_plugin_status PluginManager::host_unregister_receiver(
@@ -758,10 +1000,14 @@ mcp_plugin_status PluginManager::host_unregister_receiver(
         return MCP_PLUGIN_ERROR;
     }
 
-    return host->state->unregister_receiver(
-        *host,
-        subscription
-    );
+    try {
+        return host->state->unregister_receiver(
+            *host,
+            subscription
+        );
+    } catch (...) {
+        return MCP_PLUGIN_ERROR;
+    }
 }
 
 mcp_plugin_status PluginManager::host_publish(
@@ -781,11 +1027,71 @@ mcp_plugin_status PluginManager::host_publish(
         return MCP_PLUGIN_ERROR;
     }
 
-    return host->state->publish(
-        *host,
-        data,
-        data_size
-    );
+    try {
+        return host->state->publish(
+            *host,
+            data,
+            data_size
+        );
+    } catch (...) {
+        return MCP_PLUGIN_ERROR;
+    }
+}
+
+mcp_plugin_status PluginManager::host_publish_authenticated(
+    void* host_context,
+    const mcp_authenticated_message_context* context,
+    const uint8_t* data,
+    size_t data_size
+)
+{
+    if (host_context == nullptr) {
+        return MCP_PLUGIN_INVALID_ARGUMENT;
+    }
+
+    auto* host =
+        static_cast<AsyncState::HostContext*>(host_context);
+
+    if (host->state == nullptr) {
+        return MCP_PLUGIN_ERROR;
+    }
+
+    try {
+        return host->state->publish_authenticated(
+            *host,
+            context,
+            data,
+            data_size
+        );
+    } catch (...) {
+        return MCP_PLUGIN_ERROR;
+    }
+}
+
+
+bool PluginManager::begin_operation()
+{
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+
+    if (shutdown_requested_ || shutdown_complete_) {
+        return false;
+    }
+
+    ++active_operations_;
+    return true;
+}
+
+void PluginManager::end_operation()
+{
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+
+    if (active_operations_ > 0) {
+        --active_operations_;
+    }
+
+    if (active_operations_ == 0) {
+        lifecycle_drained_.notify_all();
+    }
 }
 
 bool PluginManager::load_directory(
@@ -793,27 +1099,34 @@ bool PluginManager::load_directory(
     const std::string& configuration_json
 )
 {
-    namespace fs = std::filesystem;
+    if (!async_state_ || !begin_operation()) {
+        return false;
+    }
 
+    auto operation_guard =
+        std::unique_ptr<PluginManager, std::function<void(PluginManager*)>>(
+            this,
+            [](PluginManager* manager) { manager->end_operation(); }
+        );
+
+    std::lock_guard<std::mutex> load_lock(load_mutex_);
+
+    namespace fs = std::filesystem;
     std::error_code ec;
 
     if (!fs::exists(directory, ec) ||
         ec ||
         !fs::is_directory(directory, ec) ||
         ec) {
-
         log_message(
             MCP_LOG_ERROR,
             "",
-            "Plugin directory does not exist or is inaccessible: " +
-                directory
+            "Plugin directory does not exist or is inaccessible: " + directory
         );
-
         return false;
     }
 
     std::vector<fs::path> libraries;
-
     fs::directory_iterator iterator(
         directory,
         fs::directory_options::skip_permission_denied,
@@ -826,7 +1139,6 @@ bool PluginManager::load_directory(
             "",
             "Cannot scan plugin directory: " + ec.message()
         );
-
         return false;
     }
 
@@ -834,13 +1146,11 @@ bool PluginManager::load_directory(
 
     while (iterator != end) {
         const fs::directory_entry entry = *iterator;
-
         std::error_code entry_error;
 
         if (entry.is_regular_file(entry_error) &&
             !entry_error &&
             entry.path().extension() == ".so") {
-
             libraries.push_back(entry.path());
         }
 
@@ -850,18 +1160,13 @@ bool PluginManager::load_directory(
             log_message(
                 MCP_LOG_ERROR,
                 "",
-                "Error while scanning plugin directory: " +
-                    ec.message()
+                "Error while scanning plugin directory: " + ec.message()
             );
-
             return false;
         }
     }
 
-    std::sort(
-        libraries.begin(),
-        libraries.end()
-    );
+    std::sort(libraries.begin(), libraries.end());
 
     log_message(
         MCP_LOG_INFO,
@@ -871,22 +1176,28 @@ bool PluginManager::load_directory(
     );
 
     for (const auto& library : libraries) {
-        if (!load_plugin(
-                library.string(),
-                configuration_json
-            )) {
-
+        if (!load_plugin(library.string(), configuration_json)) {
+            std::unique_lock<std::shared_mutex> registry_lock(registry_mutex_);
             ++rejected_plugins_;
         }
+    }
+
+    std::size_t loaded_count = 0;
+    std::size_t rejected_count = 0;
+
+    {
+        std::shared_lock<std::shared_mutex> registry_lock(registry_mutex_);
+        loaded_count = plugins_.size();
+        rejected_count = rejected_plugins_;
     }
 
     log_message(
         MCP_LOG_INFO,
         "",
         "Plugin loading finished. Loaded: " +
-            std::to_string(plugins_.size()) +
+            std::to_string(loaded_count) +
             ", rejected: " +
-            std::to_string(rejected_plugins_)
+            std::to_string(rejected_count)
     );
 
     return true;
@@ -1010,8 +1321,10 @@ bool PluginManager::load_plugin(
     record->descriptor = descriptor;
     record->id = descriptor->plugin_id;
 
-    for (const auto& existing : plugins_) {
-        if (existing->id == record->id) {
+    {
+        std::shared_lock<std::shared_mutex> registry_lock(registry_mutex_);
+        for (const auto& existing : plugins_) {
+            if (existing->id == record->id) {
             log_message(
                 MCP_LOG_ERROR,
                 record->id,
@@ -1021,7 +1334,8 @@ bool PluginManager::load_plugin(
             dlclose(record->library_handle);
             record->library_handle = nullptr;
 
-            return false;
+                return false;
+            }
         }
     }
 
@@ -1167,10 +1481,13 @@ bool PluginManager::load_plugin(
             break;
         }
 
-        for (const auto& registered : tools_) {
-            if (registered.name == tool_name) {
+        {
+            std::shared_lock<std::shared_mutex> registry_lock(registry_mutex_);
+            for (const auto& registered : tools_) {
+                if (registered.name == tool_name) {
                 valid = false;
-                break;
+                    break;
+                }
             }
         }
 
@@ -1251,23 +1568,30 @@ bool PluginManager::load_plugin(
         return false;
     }
 
-    tools_.insert(
-        tools_.end(),
-        pending_tools.begin(),
-        pending_tools.end()
-    );
+    PluginRecord* loaded_pointer = record.get();
+    const std::string loaded_id = record->id;
+
+    {
+        std::unique_lock<std::shared_mutex> registry_lock(registry_mutex_);
+
+        tools_.insert(
+            tools_.end(),
+                      pending_tools.begin(),
+                      pending_tools.end()
+        );
+
+        plugins_.push_back(std::move(record));
+    }
+
+    PluginRecord& loaded = *loaded_pointer;
 
     log_message(
         MCP_LOG_INFO,
-        record->id,
+        loaded_id,
         "Registered " +
-            std::to_string(pending_tools.size()) +
-            " tools"
+        std::to_string(pending_tools.size()) +
+        " tools"
     );
-
-    plugins_.push_back(std::move(record));
-
-    PluginRecord& loaded = *plugins_.back();
 
     if (!async_state_->activate_plugin(*loaded.host_context)) {
         log_message(
@@ -1278,16 +1602,19 @@ bool PluginManager::load_plugin(
 
         async_state_->deactivate_plugin(*loaded.host_context);
 
-        tools_.erase(
-            std::remove_if(
-                tools_.begin(),
-                tools_.end(),
-                [&loaded](const RegisteredTool& tool) {
-                    return tool.plugin_id == loaded.id;
-                }
-            ),
-            tools_.end()
-        );
+        {
+            std::unique_lock<std::shared_mutex> registry_lock(registry_mutex_);
+            tools_.erase(
+                std::remove_if(
+                    tools_.begin(),
+                    tools_.end(),
+                    [&loaded](const RegisteredTool& tool) {
+                        return tool.plugin_id == loaded.id;
+                    }
+                ),
+                tools_.end()
+            );
+        }
 
         if (loaded.initialized && loaded.descriptor != nullptr) {
             try {
@@ -1308,7 +1635,10 @@ bool PluginManager::load_plugin(
             loaded.library_handle = nullptr;
         }
 
-        plugins_.pop_back();
+        {
+            std::unique_lock<std::shared_mutex> registry_lock(registry_mutex_);
+            plugins_.pop_back();
+        }
         return false;
     }
 
@@ -1325,103 +1655,130 @@ bool PluginManager::execute_tool(
     result.clear();
     error.clear();
 
-    for (const auto& plugin : plugins_) {
-        for (const auto& tool : tools_) {
-            if (tool.plugin_id != plugin->id ||
-                tool.name != tool_name) {
-                continue;
+    if (!begin_operation()) {
+        error = "PluginManager is shutting down";
+        return false;
+    }
+
+    auto operation_guard =
+        std::unique_ptr<PluginManager, std::function<void(PluginManager*)>>(
+            this,
+            [](PluginManager* manager) { manager->end_operation(); }
+        );
+
+    PluginRecord* selected_plugin = nullptr;
+    RegisteredTool selected_tool;
+
+    {
+        std::shared_lock<std::shared_mutex> registry_lock(registry_mutex_);
+
+        for (const auto& plugin : plugins_) {
+            for (const auto& tool : tools_) {
+                if (tool.plugin_id == plugin->id &&
+                    tool.name == tool_name) {
+                    selected_plugin = plugin.get();
+                    selected_tool = tool;
+                    break;
+                }
             }
 
-            std::size_t required_size = 0;
-
-            mcp_plugin_status status = MCP_PLUGIN_ERROR;
-
-            try {
-                status = plugin->descriptor->execute_tool(
-                    plugin->plugin_context,
-                    tool_name.c_str(),
-                    arguments_json.c_str(),
-                    nullptr,
-                    &required_size
-                );
-            } catch (...) {
-                error = "Exception crossed plugin execution boundary";
-                return false;
+            if (selected_plugin != nullptr) {
+                break;
             }
-
-            if (status != MCP_PLUGIN_BUFFER_TOO_SMALL &&
-                status != MCP_PLUGIN_OK) {
-
-                error = std::string("Plugin execution failed: ") +
-                    status_name(status);
-
-                return false;
-            }
-
-            if (required_size == 0 ||
-                required_size > MAX_RESULT_SIZE) {
-
-                error = "Plugin returned an invalid result size";
-                return false;
-            }
-
-            std::vector<char> buffer(required_size, '\0');
-
-            std::size_t capacity = buffer.size();
-
-            try {
-                status = plugin->descriptor->execute_tool(
-                    plugin->plugin_context,
-                    tool_name.c_str(),
-                    arguments_json.c_str(),
-                    buffer.data(),
-                    &capacity
-                );
-            } catch (...) {
-                error = "Exception crossed plugin execution boundary";
-                return false;
-            }
-
-            if (status != MCP_PLUGIN_OK) {
-                error = std::string("Plugin execution failed: ") +
-                    status_name(status);
-
-                return false;
-            }
-
-            if (capacity == 0 ||
-                capacity > buffer.size() ||
-                buffer[capacity - 1] != '\0') {
-
-                error = "Plugin returned an invalid result buffer";
-                return false;
-            }
-
-            result.assign(buffer.data(), capacity - 1);
-
-            return true;
         }
     }
 
-    error = "Tool not found: " + tool_name;
+    if (selected_plugin == nullptr) {
+        error = "Tool not found: " + tool_name;
+        return false;
+    }
 
-    return false;
+    const auto* descriptor = selected_plugin->descriptor;
+    void* plugin_context = selected_plugin->plugin_context;
+
+    std::size_t required_size = 0;
+    mcp_plugin_status status = MCP_PLUGIN_ERROR;
+
+    try {
+        status = descriptor->execute_tool(
+            plugin_context,
+            selected_tool.name.c_str(),
+            arguments_json.c_str(),
+            nullptr,
+            &required_size
+        );
+    } catch (...) {
+        error = "Exception crossed plugin execution boundary";
+        return false;
+    }
+
+    if (status != MCP_PLUGIN_BUFFER_TOO_SMALL &&
+        status != MCP_PLUGIN_OK) {
+        error = std::string("Plugin execution failed: ") + status_name(status);
+        return false;
+    }
+
+    if (required_size == 0 || required_size > MAX_RESULT_SIZE) {
+        error = "Plugin returned an invalid result size";
+        return false;
+    }
+
+    std::vector<char> buffer(required_size, '\0');
+    std::size_t capacity = buffer.size();
+
+    try {
+        status = descriptor->execute_tool(
+            plugin_context,
+            selected_tool.name.c_str(),
+            arguments_json.c_str(),
+            buffer.data(),
+            &capacity
+        );
+    } catch (...) {
+        error = "Exception crossed plugin execution boundary";
+        return false;
+    }
+
+    if (status != MCP_PLUGIN_OK) {
+        error = std::string("Plugin execution failed: ") + status_name(status);
+        return false;
+    }
+
+    if (capacity == 0 ||
+        capacity > buffer.size() ||
+        buffer[capacity - 1] != '\0') {
+        error = "Plugin returned an invalid result buffer";
+        return false;
+    }
+
+    result.assign(buffer.data(), capacity - 1);
+    return true;
 }
 
 const std::vector<RegisteredTool>& PluginManager::tools() const
 {
+    // Legacy accessor: only safe while the registry is not being modified.
+    return tools_;
+}
+
+std::vector<RegisteredTool> PluginManager::tools_snapshot() const
+{
+    std::shared_lock<std::shared_mutex> registry_lock(registry_mutex_);
     return tools_;
 }
 
 std::size_t PluginManager::plugin_count() const
 {
+    std::shared_lock<std::shared_mutex> registry_lock(registry_mutex_);
     return plugins_.size();
 }
 
 std::size_t PluginManager::tool_count() const
 {
+    std::shared_lock<std::shared_mutex> registry_lock(registry_mutex_);
     return tools_.size();
 }
+
 
 void PluginManager::set_message_handler(
     PluginMessageHandler handler
@@ -1433,11 +1790,19 @@ void PluginManager::set_message_handler(
 
     AsyncState& state = *async_state_;
 
-    // Handler lifecycle operations are not allowed from
-    // inside the Core message callback.
     if (AsyncState::executing_core_handler == &state) {
         return;
     }
+
+    std::shared_ptr<PluginMessageHandler> replacement;
+
+    if (handler) {
+        replacement = std::make_shared<PluginMessageHandler>(
+            std::move(handler)
+        );
+    }
+
+    std::shared_ptr<PluginMessageHandler> previous;
 
     {
         std::unique_lock<std::mutex> lock(state.mutex);
@@ -1449,13 +1814,44 @@ void PluginManager::set_message_handler(
             }
         );
 
-        state.message_handler = std::move(handler);
+        if (state.stopping) {
+            return;
+        }
+
+        state.core_handler_draining = true;
+
+        state.core_callbacks_drained.wait(
+            lock,
+            [&state] {
+                return state.active_core_callbacks == 0;
+            }
+        );
+
+        if (state.stopping) {
+            state.core_handler_draining = false;
+            state.core_callbacks_drained.notify_all();
+            return;
+        }
+
+        previous.swap(state.message_handler);
+        state.message_handler = std::move(replacement);
+        state.core_handler_draining = false;
     }
 
+    previous.reset();
+
+    state.core_callbacks_drained.notify_all();
     state.available.notify_all();
 }
 
 void PluginManager::clear_message_handler()
+{
+    set_message_handler(nullptr);
+}
+
+void PluginManager::set_authenticated_message_handler(
+    AuthenticatedPluginMessageHandler handler
+)
 {
     if (!async_state_) {
         return;
@@ -1463,36 +1859,64 @@ void PluginManager::clear_message_handler()
 
     AsyncState& state = *async_state_;
 
-    // Do not modify the handler from inside its own callback.
     if (AsyncState::executing_core_handler == &state) {
         return;
     }
 
-    std::unique_lock<std::mutex> lock(state.mutex);
+    std::shared_ptr<AuthenticatedPluginMessageHandler> replacement;
 
-    state.core_callbacks_drained.wait(
-        lock,
-        [&state] {
-            return !state.core_handler_draining;
+    if (handler) {
+        replacement =
+            std::make_shared<AuthenticatedPluginMessageHandler>(
+                std::move(handler)
+            );
+    }
+
+    std::shared_ptr<AuthenticatedPluginMessageHandler> previous;
+
+    {
+        std::unique_lock<std::mutex> lock(state.mutex);
+
+        state.core_callbacks_drained.wait(
+            lock,
+            [&state] {
+                return !state.authenticated_handler_draining;
+            }
+        );
+
+        if (state.stopping) {
+            return;
         }
-    );
 
-    state.core_handler_draining = true;
-    state.message_handler = nullptr;
+        state.authenticated_handler_draining = true;
 
-    state.core_callbacks_drained.wait(
-        lock,
-        [&state] {
-            return state.active_core_callbacks == 0;
+        state.core_callbacks_drained.wait(
+            lock,
+            [&state] {
+                return state.active_authenticated_callbacks == 0;
+            }
+        );
+
+        if (state.stopping) {
+            state.authenticated_handler_draining = false;
+            state.core_callbacks_drained.notify_all();
+            return;
         }
-    );
 
-    state.core_handler_draining = false;
+        previous.swap(state.authenticated_message_handler);
+        state.authenticated_message_handler = std::move(replacement);
+        state.authenticated_handler_draining = false;
+    }
 
-    lock.unlock();
+    previous.reset();
 
     state.core_callbacks_drained.notify_all();
     state.available.notify_all();
+}
+
+void PluginManager::clear_authenticated_message_handler()
+{
+    set_authenticated_message_handler(nullptr);
 }
 
 bool PluginManager::send_plugin_message(
@@ -1523,19 +1947,83 @@ bool PluginManager::send_plugin_message(
 
 void PluginManager::shutdown()
 {
-    for (auto it = plugins_.rbegin();
-         it != plugins_.rend();
-         ++it) {
+    if (!async_state_) {
+        return;
+    }
 
+    // Preserve deferred shutdown when invoked by the asynchronous worker.
+    if (AsyncState::executing_core_handler == async_state_.get() ||
+        AsyncState::executing_subscription != nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            shutdown_requested_ = true;
+        }
+
+        async_state_->stop_worker();
+        log_message(
+            MCP_LOG_WARNING,
+            "",
+            "PluginManager shutdown deferred: called from async worker"
+        );
+        return;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(lifecycle_mutex_);
+
+        if (shutdown_complete_) {
+            return;
+        }
+
+        if (shutdown_in_progress_) {
+            lifecycle_drained_.wait(lock, [this] {
+                return shutdown_complete_ || !shutdown_in_progress_;
+            });
+
+            if (shutdown_complete_) {
+                return;
+            }
+        }
+
+        shutdown_in_progress_ = true;
+        shutdown_requested_ = true;
+
+        lifecycle_drained_.wait(lock, [this] {
+            return active_operations_ == 0;
+        });
+    }
+
+    if (!async_state_->stop_worker()) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        shutdown_in_progress_ = false;
+        lifecycle_drained_.notify_all();
+        log_message(
+            MCP_LOG_ERROR,
+            "",
+            "PluginManager shutdown deferred: worker has not stopped"
+        );
+        return;
+    }
+
+    std::vector<std::unique_ptr<PluginRecord>> plugins_to_shutdown;
+
+    {
+        std::unique_lock<std::shared_mutex> registry_lock(registry_mutex_);
+        plugins_to_shutdown.swap(plugins_);
+        tools_.clear();
+    }
+
+    // Never call plugin code or dlclose while holding registry_mutex_.
+    for (auto it = plugins_to_shutdown.rbegin();
+         it != plugins_to_shutdown.rend();
+         ++it) {
         PluginRecord& plugin = **it;
 
         if (plugin.host_context) {
             async_state_->deactivate_plugin(*plugin.host_context);
         }
 
-        if (plugin.initialized &&
-            plugin.descriptor != nullptr) {
-
+        if (plugin.initialized && plugin.descriptor != nullptr) {
             log_message(
                 MCP_LOG_INFO,
                 plugin.id,
@@ -1543,9 +2031,7 @@ void PluginManager::shutdown()
             );
 
             try {
-                plugin.descriptor->shutdown(
-                    plugin.plugin_context
-                );
+                plugin.descriptor->shutdown(plugin.plugin_context);
             } catch (...) {
                 log_message(
                     MCP_LOG_ERROR,
@@ -1563,8 +2049,14 @@ void PluginManager::shutdown()
         }
     }
 
-    plugins_.clear();
-    tools_.clear();
+    plugins_to_shutdown.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        shutdown_complete_ = true;
+        shutdown_in_progress_ = false;
+        lifecycle_drained_.notify_all();
+    }
 }
 
 } // namespace mcp
