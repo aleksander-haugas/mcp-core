@@ -463,6 +463,33 @@ void run_tests()
         "Unable to register slow method: " + error
     );
 
+    // Invalid configuration: default timeout exceeds the maximum.
+    {
+        mcp::OrchestratorConfig invalid_config;
+        invalid_config.default_timeout =
+            std::chrono::milliseconds(300001);
+        invalid_config.max_task_timeout =
+            std::chrono::milliseconds(300000);
+
+        mcp::Orchestrator invalid_orchestrator(
+            registry,
+            rpc_a,
+            invalid_config
+        );
+
+        require(
+            !invalid_orchestrator.start(error),
+            "Orchestrator accepted default_timeout above max_task_timeout"
+        );
+
+        require(
+            error == "default_timeout exceeds max_task_timeout",
+            "Unexpected default timeout validation error: " + error
+        );
+
+        std::cout << "[PASS] Default timeout configuration validation\n";
+    }
+
     mcp::OrchestratorConfig config;
     config.worker_count = 2;
     config.max_queued_tasks = 16;
@@ -647,6 +674,29 @@ void run_tests()
         advanced.start(error),
         "Unable to start advanced Orchestrator: " + error
     );
+
+    // Reject task timeouts above the configured five-minute maximum.
+    {
+        mcp::TaskRequest request;
+        request.method = "test.echo";
+        request.required_capabilities = {"test.echo"};
+        request.timeout = std::chrono::milliseconds(300001);
+
+        std::string task_id;
+
+        require(
+            !advanced.submit(request, task_id, error),
+            "Orchestrator accepted a timeout above five minutes"
+        );
+
+        require(
+            error ==
+                "Task timeout exceeds max_task_timeout or is invalid",
+            "Unexpected maximum timeout validation error: " + error
+        );
+
+        std::cout << "[PASS] Maximum task timeout enforcement\n";
+    }
 
     // Test 4: concurrencia predeterminada = 1.
     std::string concurrency_task_a;
@@ -949,7 +999,12 @@ void run_tests()
         "Unexpected active-agent unregister error: " + unregister_error
     );
 
-    std::thread stopper([&advanced]() {
+    // Dos hilos solicitan el apagado concurrentemente.
+    std::thread stopper_a([&advanced]() {
+        advanced.stop();
+    });
+
+    std::thread stopper_b([&advanced]() {
         advanced.stop();
     });
 
@@ -972,7 +1027,26 @@ void run_tests()
 
     // Permitir que la RPC activa termine para que stop() pueda unir workers.
     release_gate(*shutdown_gate);
-    stopper.join();
+
+    stopper_a.join();
+    stopper_b.join();
+
+    // stop() debe seguir siendo seguro después del apagado.
+    advanced.stop();
+
+    // No se deben aceptar nuevas tareas después de stop().
+    std::string after_stop_task_id;
+    require(
+        !advanced.submit(
+            queued_request,
+            after_stop_task_id,
+            error
+        ),
+        "Orchestrator accepted a task after stop"
+    );
+
+    std::cout << "[PASS] Concurrent and idempotent Orchestrator stop\n";
+    std::cout << "[PASS] Submit rejected after Orchestrator stop\n";
 
     mcp::TaskSnapshot active_snapshot;
 
@@ -994,6 +1068,164 @@ void run_tests()
 
     std::cout << "[PASS] Queue capacity and active unregister protection\n";
     std::cout << "[PASS] Stop with active and pending tasks\n";
+
+    // Test 7: AgentRpc::stop() wakes an Orchestrator worker
+    // waiting for a remote RPC response.
+    {
+        mcp::AgentRegistry stop_registry;
+
+        require(
+            stop_registry.register_agent({
+                orchestrator_identity,
+                "principal-a",
+                "orchestrator-test",
+                true
+            }, error),
+            "Unable to register RPC-stop orchestrator identity: " + error
+        );
+
+        require(
+            stop_registry.register_agent({
+                executor_identity,
+                "principal-b",
+                "orchestrator-test",
+                true
+            }, error),
+            "Unable to register RPC-stop executor identity: " + error
+        );
+
+        mcp::AgentBus stop_bus_a(stop_registry);
+        mcp::AgentBus stop_bus_b(stop_registry);
+
+        auto stop_transports = make_transport_pair();
+
+        require(
+            stop_bus_a.add_transport(stop_transports.first, error),
+            "Unable to add RPC-stop transport A: " + error
+        );
+
+        require(
+            stop_bus_b.add_transport(stop_transports.second, error),
+            "Unable to add RPC-stop transport B: " + error
+        );
+
+        mcp::AgentRpc stop_rpc_a(
+            stop_bus_a,
+            orchestrator_identity,
+            "principal-a"
+        );
+
+        mcp::AgentRpc stop_rpc_b(
+            stop_bus_b,
+            executor_identity,
+            "principal-b"
+        );
+
+        auto rpc_stop_gate = std::make_shared<GateState>();
+
+        require(
+            stop_rpc_b.register_method(
+                "test.gated.rpc_stop",
+                make_gated_handler(rpc_stop_gate, "rpc-stop-ok"),
+                error
+            ),
+            "Unable to register RPC-stop gate: " + error
+        );
+
+        mcp::OrchestratorConfig stop_config;
+        stop_config.worker_count = 1;
+        stop_config.default_timeout = 5000ms;
+
+        mcp::Orchestrator stop_orchestrator(
+            stop_registry,
+            stop_rpc_a,
+            stop_config
+        );
+
+        mcp::AgentDescriptor stop_executor;
+        stop_executor.identity = executor_identity;
+        stop_executor.capabilities = {"test.gated.rpc_stop"};
+
+        require(
+            stop_orchestrator.register_agent(stop_executor, error),
+            "Unable to register RPC-stop executor: " + error
+        );
+
+        require(
+            stop_orchestrator.start(error),
+            "Unable to start RPC-stop Orchestrator: " + error
+        );
+
+        mcp::TaskRequest stop_request;
+        stop_request.method = "test.gated.rpc_stop";
+        stop_request.required_capabilities = {
+            "test.gated.rpc_stop"
+        };
+        stop_request.timeout = 5000ms;
+
+        std::string stop_task_id;
+
+        require(
+            stop_orchestrator.submit(
+                stop_request,
+                stop_task_id,
+                error
+            ),
+            "Unable to submit RPC-stop task: " + error
+        );
+
+        const bool remote_handler_entered =
+            wait_for_entries(*rpc_stop_gate, 1, 3000ms);
+
+        if (!remote_handler_entered) {
+            release_gate(*rpc_stop_gate);
+        }
+
+        require(
+            remote_handler_entered,
+            "Remote RPC-stop handler did not start"
+        );
+
+        // This must wake the pending AgentRpc::call() immediately.
+        stop_rpc_a.stop();
+
+        mcp::TaskSnapshot stopped_rpc_snapshot;
+
+        const bool rpc_stop_finished = wait_for_terminal(
+            stop_orchestrator,
+            stop_task_id,
+            stopped_rpc_snapshot,
+            2000ms
+        );
+
+        // Always release the remote handler before asserting the result.
+        release_gate(*rpc_stop_gate);
+
+        require(
+            rpc_stop_finished,
+            "Orchestrator task did not finish after AgentRpc::stop()"
+        );
+
+        require(
+            stopped_rpc_snapshot.state == mcp::TaskState::FAILED,
+            "Task was not FAILED after AgentRpc::stop()"
+        );
+
+        require(
+            stopped_rpc_snapshot.error == "AgentRpc stopped",
+            "Unexpected error after AgentRpc::stop(): " +
+                stopped_rpc_snapshot.error
+        );
+
+        // The remote handler can now return; shut down its RPC and bus.
+        stop_rpc_b.stop();
+        stop_orchestrator.stop();
+
+        stop_bus_a.stop();
+        stop_bus_b.stop();
+
+        std::cout << "[PASS] AgentRpc stop wakes pending Orchestrator RPC\n";
+    }
 
     // AgentRpc owns the AgentBus message handler.
     rpc_a.stop();

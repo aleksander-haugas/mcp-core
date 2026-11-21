@@ -79,13 +79,19 @@ public:
         return false;
             }
 
+            if (config.max_task_timeout.count() <= 0 ||
+                config.max_task_timeout.count() >
+                    static_cast<std::int64_t>(
+                        std::numeric_limits<unsigned int>::max())) {
+                error = "max_task_timeout is outside the supported range";
+                return false;
+            }
+
             if (config.default_timeout.count() <= 0 ||
-                config.default_timeout.count() >
-                static_cast<std::int64_t>(
-                    std::numeric_limits<unsigned int>::max())) {
-                error = "default_timeout is outside the supported range";
-            return false;
-                    }
+                config.default_timeout > config.max_task_timeout) {
+                error = "default_timeout exceeds max_task_timeout";
+                return false;
+            }
 
                     try {
                         workers.reserve(config.worker_count);
@@ -265,10 +271,8 @@ public:
                 : request.timeout;
 
         if (timeout.count() <= 0 ||
-            timeout.count() >
-                static_cast<std::int64_t>(
-                    std::numeric_limits<unsigned int>::max())) {
-            error = "Task timeout is outside the supported range";
+            timeout > config.max_task_timeout) {
+            error = "Task timeout exceeds max_task_timeout or is invalid";
             return false;
         }
 

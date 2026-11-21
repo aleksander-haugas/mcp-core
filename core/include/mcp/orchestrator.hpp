@@ -37,6 +37,8 @@ struct OrchestratorConfig {
 
     // Default RPC timeout.
     std::chrono::milliseconds default_timeout{5000};
+    // Maximum permitted timeout for an individual task.
+    std::chrono::milliseconds max_task_timeout{300000};
 };
 
 struct AgentDescriptor {
