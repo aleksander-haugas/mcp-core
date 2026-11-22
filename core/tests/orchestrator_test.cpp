@@ -1,4 +1,6 @@
 #include "mcp/orchestrator.hpp"
+#include "mcp/llama_planner.hpp"
+#include "mcp/plan_submitter.hpp"
 
 #include "mcp/agent_bus.hpp"
 #include "mcp/agent_rpc.hpp"
@@ -551,6 +553,74 @@ void run_tests()
         std::cout << "[PASS] Successful RPC execution\n";
     }
 
+    // Test 1b: LlamaPlanner -> PlanSubmitter -> Orchestrator -> AgentRpc.
+    {
+        mcp::PlanValidatorConfig validator_config;
+        validator_config.allowed_methods = {
+            {"test.echo", {"test.echo"}}
+        };
+
+        mcp::PlanValidator validator(validator_config);
+
+        const std::string model_proposal =
+            R"({"version":1,"tasks":[{"method":"test.echo","payload":{"input":99},"timeout_ms":5000}]})";
+
+        mcp::LlamaPlanner planner(
+            [model_proposal](
+                const std::vector<mcp::LlamaMessage>&,
+                mcp::LlamaCompletion& completion,
+                std::string&) {
+                completion.content = model_proposal;
+                return true;
+            },
+            validator
+        );
+
+        mcp::ValidatedPlan plan;
+        require(
+            planner.create_plan("Run an echo test", plan, error),
+            "Unable to create integration test plan: " + error
+        );
+
+        mcp::PlanSubmitter submitter;
+        mcp::PlanSubmissionResult submission;
+
+        require(
+            submitter.submit(plan, orchestrator, submission, error),
+            "Unable to submit validated plan: " + error
+        );
+
+        require(
+            submission.task_ids.size() == 1,
+            "Unexpected number of submitted plan tasks"
+        );
+
+        mcp::TaskSnapshot snapshot;
+
+        require(
+            wait_for_terminal(
+                orchestrator,
+                submission.task_ids[0],
+                snapshot,
+                3000ms
+            ),
+            "Planner-submitted task did not reach a terminal state"
+        );
+
+        require(
+            snapshot.state == mcp::TaskState::COMPLETED,
+            "Planner-submitted task did not complete: " + snapshot.error
+        );
+
+        require(
+            snapshot.result_json == "{\"result\":\"echo-ok\"}",
+            "Unexpected planner-submitted RPC result: " +
+                snapshot.result_json
+        );
+
+        std::cout << "[PASS] LlamaPlanner to Orchestrator integration\n";
+    }
+
     // Test 2: remote method failure.
     {
         mcp::TaskRequest request;
@@ -964,14 +1034,58 @@ void run_tests()
         "Shutdown handler did not start"
     );
 
+    mcp::PlanValidatorConfig partial_config;
+    partial_config.allowed_methods = {
+        {"test.echo", {"test.echo"}}
+    };
+
+    mcp::PlanValidator partial_validator(partial_config);
+
+    const std::string partial_proposal =
+        R"({"version":1,"tasks":[{"method":"test.echo","payload":{"input":1},"timeout_ms":2000},{"method":"test.echo","payload":{"input":2},"timeout_ms":2000}]})";
+
+    mcp::ValidatedPlan partial_plan;
+
+    require(
+        partial_validator.validate(partial_proposal, partial_plan, error),
+        "Unable to validate partial submission plan: " + error
+    );
+
+    mcp::PlanSubmitter partial_submitter;
+    mcp::PlanSubmissionResult partial_result;
+
+    require(
+        !partial_submitter.submit(
+            partial_plan,
+            advanced,
+            partial_result,
+            error
+        ),
+        "PlanSubmitter unexpectedly accepted a plan beyond queue capacity"
+    );
+
+    require(
+        partial_result.task_ids.size() == 1,
+        "PlanSubmitter did not preserve the first accepted task ID"
+    );
+
+    require(
+        partial_result.failed_task_index == 1,
+        "PlanSubmitter reported the wrong failed task index"
+    );
+
+    require(
+        error.find("Orchestrator task queue is full") != std::string::npos,
+        "Unexpected partial submission error: " + error
+    );
+
+    pending_task_id = partial_result.task_ids.front();
+
+    std::cout << "[PASS] PlanSubmitter partial submission and queue rejection\n";
+
     mcp::TaskRequest queued_request;
     queued_request.method = "test.echo";
     queued_request.required_capabilities = {"test.echo"};
-
-    require(
-        advanced.submit(queued_request, pending_task_id, error),
-        "Unable to submit pending queue task: " + error
-    );
 
     require(
         !advanced.submit(queued_request, rejected_task_id, error),
