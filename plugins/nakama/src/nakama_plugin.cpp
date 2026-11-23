@@ -625,6 +625,10 @@ struct NakamaPluginContext {
     std::shared_ptr<nakama::WebSocketTransport> transport;
     std::shared_ptr<nakama::ReceiveDispatcher> dispatcher;
 
+    // Core -> Nakama asynchronous messaging (ABI v2).
+    const mcp_async_messages_v2* async_messages = nullptr;
+    void* async_subscription = nullptr;
+
     std::string jwt;
     std::string last_error;
     std::deque<nakama::WebSocketMessage> pending_messages;
@@ -679,6 +683,362 @@ void set_last_error(
     context->last_error = error;
 }
 
+void set_last_error_noexcept(
+    NakamaPluginContext* context,
+    const char* error
+) noexcept
+{
+    if (context == nullptr || error == nullptr) {
+        return;
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(context->error_mutex);
+        context->last_error = error;
+    } catch (...) {
+        // Never allow an exception to escape an ABI callback.
+    }
+}
+
+std::string make_agent_rpc_cid()
+{
+    static std::atomic<uint64_t> counter{0};
+
+    const uint64_t sequence = ++counter;
+    const auto timestamp =
+        std::chrono::steady_clock::now()
+            .time_since_epoch()
+            .count();
+
+    return "mcp-core-agent-" +
+           std::to_string(timestamp) + "-" +
+           std::to_string(sequence);
+}
+
+bool consume_agent_rpc_response(
+    NakamaPluginContext* context,
+    const nakama::WebSocketMessage& message
+) noexcept
+{
+    if (context == nullptr ||
+        message.type != nakama::WebSocketMessageType::TEXT ||
+        message.payload.empty() ||
+        message.payload.size() > 4 * 1024 * 1024 ||
+        message.payload.size() > static_cast<size_t>(INT32_MAX)) {
+        return false;
+    }
+
+    try {
+
+
+    json_tokener* tokener = json_tokener_new();
+    if (tokener == nullptr) {
+        return false;
+    }
+
+    json_tokener_set_flags(
+        tokener,
+        JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8
+    );
+
+    json_object* root = json_tokener_parse_ex(
+        tokener,
+        message.payload.data(),
+        static_cast<int>(message.payload.size())
+    );
+
+    const bool parse_ok =
+        json_tokener_get_error(tokener) == json_tokener_success &&
+        root != nullptr;
+
+    const size_t parse_end = json_tokener_get_parse_end(tokener);
+    json_tokener_free(tokener);
+
+    if (!parse_ok) {
+        if (root != nullptr) {
+            json_object_put(root);
+        }
+        return false;
+    }
+
+    bool trailing_valid = parse_end <= message.payload.size();
+
+    for (size_t i = parse_end;
+         trailing_valid && i < message.payload.size();
+         ++i) {
+        trailing_valid =
+            std::isspace(
+                static_cast<unsigned char>(message.payload[i])
+            ) != 0;
+    }
+
+    if (!trailing_valid ||
+        json_object_get_type(root) != json_type_object) {
+        json_object_put(root);
+        return false;
+    }
+
+    json_object* cid_value = nullptr;
+
+    if (!json_object_object_get_ex(root, "cid", &cid_value) ||
+        json_object_get_type(cid_value) != json_type_string) {
+        json_object_put(root);
+        return false;
+    }
+
+    const char* cid_data = json_object_get_string(cid_value);
+    const int cid_length = json_object_get_string_len(cid_value);
+
+    if (cid_data == nullptr || cid_length < 0) {
+        json_object_put(root);
+        return false;
+    }
+
+    const std::string cid(cid_data, static_cast<size_t>(cid_length));
+    static const std::string PREFIX = "mcp-core-agent-";
+
+    if (cid.compare(0, PREFIX.size(), PREFIX) != 0) {
+        json_object_put(root);
+        return false;
+    }
+
+    json_object* rpc_value = nullptr;
+    json_object* error_value = nullptr;
+
+    const bool has_rpc =
+        json_object_object_get_ex(root, "rpc", &rpc_value);
+    const bool has_error =
+        json_object_object_get_ex(root, "error", &error_value);
+
+    if (has_rpc && has_error) {
+        set_last_error_noexcept(
+            context,
+            "Malformed Nakama agent RPC response: rpc and error are both present"
+        );
+        json_object_put(root);
+        return true;
+    }
+
+    if (has_error) {
+        const char* error_text =
+            json_object_to_json_string_ext(
+                error_value,
+                JSON_C_TO_STRING_PLAIN
+            );
+
+        set_last_error_noexcept(
+            context,
+            error_text != nullptr
+                ? error_text
+                : "Nakama agent RPC returned an unspecified error"
+        );
+
+        json_object_put(root);
+        return true;
+    }
+
+    if (!has_rpc ||
+        json_object_get_type(rpc_value) != json_type_object) {
+        set_last_error_noexcept(
+            context,
+            "Malformed Nakama agent RPC response"
+        );
+        json_object_put(root);
+        return true;
+    }
+
+    json_object* rpc_id = nullptr;
+
+    if (!json_object_object_get_ex(rpc_value, "id", &rpc_id) ||
+        json_object_get_type(rpc_id) != json_type_string ||
+        std::strcmp(
+            json_object_get_string(rpc_id),
+            "mcp_agents_send"
+        ) != 0) {
+        set_last_error_noexcept(
+            context,
+            "Unexpected Nakama agent RPC response identifier"
+        );
+        json_object_put(root);
+        return true;
+    }
+
+    // A successful asynchronous RPC must not clear an unrelated
+    // error recorded by another operation.
+
+    json_object_put(root);
+    return true;
+    } catch (...) {
+        set_last_error_noexcept(
+            context,
+            "Exception while processing Nakama agent RPC response"
+        );
+        return false;
+    }
+}
+
+void nakama_async_receiver(
+    void* user_data,
+    const uint8_t* data,
+    size_t data_size
+) noexcept
+{
+    auto* context =
+        static_cast<NakamaPluginContext*>(user_data);
+
+    if (context == nullptr) {
+        return;
+    }
+
+    constexpr size_t MAX_AGENT_MESSAGE_SIZE = 1024 * 1024;
+    constexpr size_t MAX_WEBSOCKET_MESSAGE_SIZE = 4 * 1024 * 1024;
+
+    if (data == nullptr ||
+        data_size == 0 ||
+        data_size > MAX_AGENT_MESSAGE_SIZE ||
+        data_size > static_cast<size_t>(INT_MAX)) {
+        set_last_error_noexcept(
+            context,
+            "Invalid or oversized Core-to-Nakama Agent message"
+        );
+        return;
+    }
+
+    try {
+        // The ABI buffer is borrowed only for this callback.
+        // Copy it before constructing the Nakama RPC request.
+        const std::string agent_payload(
+            reinterpret_cast<const char*>(data),
+            data_size
+        );
+
+        auto transport = get_transport(context);
+
+        if (transport == nullptr || !transport->is_connected()) {
+            set_last_error_noexcept(
+                context,
+                "Core message could not be delivered: Nakama is disconnected"
+            );
+            return;
+        }
+
+        const std::string cid = make_agent_rpc_cid();
+
+        json_object* request = json_object_new_object();
+        json_object* rpc = json_object_new_object();
+
+        if (request == nullptr || rpc == nullptr) {
+            if (request != nullptr) {
+                json_object_put(request);
+            }
+            if (rpc != nullptr) {
+                json_object_put(rpc);
+            }
+
+            set_last_error_noexcept(
+                context,
+                "Could not allocate Nakama agent RPC envelope"
+            );
+            return;
+        }
+
+        auto add_string = [](
+            json_object* object,
+            const char* key,
+            const std::string& value
+        ) -> bool {
+            if (value.size() > static_cast<size_t>(INT_MAX)) {
+                return false;
+            }
+
+            json_object* field = json_object_new_string_len(
+                value.data(),
+                static_cast<int>(value.size())
+            );
+
+            if (field == nullptr) {
+                return false;
+            }
+
+            if (json_object_object_add(object, key, field) != 0) {
+                json_object_put(field);
+                return false;
+            }
+
+            return true;
+        };
+
+        const bool fields_added =
+            add_string(request, "cid", cid) &&
+            add_string(rpc, "id", "mcp_agents_send") &&
+            add_string(rpc, "payload", agent_payload);
+
+        bool rpc_attached = false;
+
+        if (fields_added &&
+            json_object_object_add(request, "rpc", rpc) == 0) {
+            rpc_attached = true;
+        }
+
+        if (!fields_added || !rpc_attached) {
+            if (!rpc_attached) {
+                json_object_put(rpc);
+            }
+
+            json_object_put(request);
+
+            set_last_error_noexcept(
+                context,
+                "Could not construct Nakama agent RPC envelope"
+            );
+            return;
+        }
+
+        const char* serialized =
+            json_object_to_json_string_ext(
+                request,
+                JSON_C_TO_STRING_PLAIN
+            );
+
+        if (serialized == nullptr) {
+            json_object_put(request);
+
+            set_last_error_noexcept(
+                context,
+                "Could not serialize Nakama agent RPC envelope"
+            );
+            return;
+        }
+
+        const std::string rpc_payload(serialized);
+        json_object_put(request);
+
+        if (rpc_payload.empty() ||
+            rpc_payload.size() > MAX_WEBSOCKET_MESSAGE_SIZE) {
+            set_last_error_noexcept(
+                context,
+                "Nakama agent RPC envelope exceeds the WebSocket message limit"
+            );
+            return;
+        }
+
+        // Reuse the existing authenticated WebSocket connection.
+        // send_text() only queues the frame; it does not wait for network I/O
+        // or for the Nakama RPC response.
+        if (!transport->send_text(rpc_payload)) {
+            set_last_error_noexcept(
+                context,
+                "Nakama WebSocket rejected the outgoing agent RPC"
+            );
+        }
+    } catch (...) {
+        set_last_error_noexcept(
+            context,
+            "Exception while forwarding Core message through Nakama RPC"
+        );
+    }
+}
+
 void clear_last_error(NakamaPluginContext* context)
 {
     if (context == nullptr) {
@@ -721,6 +1081,10 @@ bool start_receive_dispatcher(
         dispatcher = std::make_shared<nakama::ReceiveDispatcher>(
             transport,
             [context](const nakama::WebSocketMessage& message) {
+                if (consume_agent_rpc_response(context, message)) {
+                    return;
+                }
+
                 std::lock_guard<std::mutex> lock(context->messages_mutex);
 
                 if (context->pending_messages.size() < 256) {
@@ -901,9 +1265,6 @@ const char* transport_state_name(nakama::TransportState state)
     return "UNKNOWN";
 }
 
-
-
-
 mcp_plugin_status initialize(
     const mcp_host_api* host,
     const char* configuration_json,
@@ -930,15 +1291,96 @@ mcp_plugin_status initialize(
     context->host = host;
     context->config = NakamaConfig{};
     context->config_state = ConfigState::MISSING;
-
     context->config_state = load_config_state(&context->config);
 
+    // ABI v2 is optional for compatibility with older hosts.
+    if (host->get_extension != nullptr) {
+        const void* extension = nullptr;
+
+        const mcp_plugin_status extension_status =
+        host->get_extension(
+            host->host_context,
+            MCP_PLUGIN_EXT_ASYNC_MESSAGES,
+            MCP_PLUGIN_ASYNC_MESSAGES_VERSION_2,
+            &extension
+        );
+
+        if (extension_status == MCP_PLUGIN_OK) {
+            const auto* async_messages =
+            static_cast<const mcp_async_messages_v2*>(extension);
+
+            if (async_messages == nullptr ||
+                async_messages->struct_size <
+                sizeof(mcp_async_messages_v2) ||
+                async_messages->version !=
+                MCP_PLUGIN_ASYNC_MESSAGES_VERSION_2 ||
+                async_messages->register_receiver == nullptr ||
+                async_messages->unregister_receiver == nullptr ||
+                async_messages->publish == nullptr ||
+                async_messages->publish_authenticated == nullptr) {
+                delete context;
+            return MCP_PLUGIN_ERROR;
+                }
+
+                context->async_messages = async_messages;
+
+                void* subscription = nullptr;
+
+                const mcp_plugin_status registration_status =
+                async_messages->register_receiver(
+                    host->host_context,
+                    nakama_async_receiver,
+                    context,
+                    &subscription
+                );
+
+                if (registration_status != MCP_PLUGIN_OK ||
+                    subscription == nullptr) {
+                    if (subscription != nullptr) {
+                        async_messages->unregister_receiver(
+                            host->host_context,
+                            subscription
+                        );
+                    }
+
+                    delete context;
+
+                return registration_status == MCP_PLUGIN_OK
+                ? MCP_PLUGIN_ERROR
+                : registration_status;
+                    }
+
+                    context->async_subscription = subscription;
+        } else if (extension_status == MCP_PLUGIN_NOT_SUPPORTED) {
+            log_message(
+                context,
+                MCP_LOG_WARNING,
+                "Async messaging ABI v2 is unavailable; "
+                "Nakama AgentBus bridge is disabled"
+            );
+        } else {
+            delete context;
+            return extension_status;
+        }
+    } else {
+        log_message(
+            context,
+            MCP_LOG_WARNING,
+            "Host does not expose extension lookup; "
+            "Nakama AgentBus bridge is disabled"
+        );
+    }
+
+    // Publish the context only after successful initialization
+    // and, when available, successful receiver registration.
     *plugin_context = context;
 
     log_message(
         context,
         MCP_LOG_INFO,
-        "Nakama plugin initialized; configuration state evaluated"
+        context->async_subscription != nullptr
+        ? "Nakama plugin initialized with async ABI v2 receiver"
+        : "Nakama plugin initialized without async messaging"
     );
 
     return MCP_PLUGIN_OK;
@@ -947,7 +1389,11 @@ mcp_plugin_status initialize(
 void shutdown(void* plugin_context)
 {
     auto* context =
-        static_cast<NakamaPluginContext*>(plugin_context);
+    static_cast<NakamaPluginContext*>(plugin_context);
+
+    if (context == nullptr) {
+        return;
+    }
 
     log_message(
         context,
@@ -955,7 +1401,7 @@ void shutdown(void* plugin_context)
         "Nakama plugin shutting down"
     );
 
-    if (context != nullptr) {
+    {
         std::lock_guard<std::mutex> lifecycle_lock(
             context->lifecycle_mutex
         );
@@ -968,6 +1414,14 @@ void shutdown(void* plugin_context)
             transport->stop();
             set_transport(context, nullptr);
         }
+
+        // PluginManager has already deactivated this subscription
+        // and drained its callbacks before invoking shutdown().
+        context->async_subscription = nullptr;
+        context->async_messages = nullptr;
+
+        // JWT is memory-only and must not survive plugin shutdown.
+        context->jwt.clear();
     }
 
     delete context;
@@ -1388,6 +1842,7 @@ mcp_plugin_status execute_tool(
                             ws_config.connect_timeout_ms =
                             context->config.connect_timeout_ms;
                             ws_config.io_poll_interval_ms = 100;
+                            ws_config.max_message_bytes = 4 * 1024 * 1024;
                             ws_config.verify_tls = context->config.verify_tls;
 
                             transport = std::make_shared<nakama::WebSocketTransport>(

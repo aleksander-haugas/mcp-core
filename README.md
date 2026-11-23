@@ -32,15 +32,39 @@ The core includes components for agent communication:
 - AgentRPC
 - AgentTransport
 
-## Building
+## Building on FreeBSD
 
-The plugins currently provide individual FreeBSD Makefiles.
+The repository uses native BSD make. The root Makefile builds the Core
+runtime and delegates plugin builds to their existing Makefiles.
 
-The repository does not yet include a top-level build system for the
-core runtime. Core build and test instructions will be documented
-when that build process is consolidated.
+Requirements:
+- FreeBSD with BSD make
+- Clang/LLVM with C++17 support
+- `pkg-config`
+- `libcurl` and `json-c` development files
 
-Plugin build dependencies are defined by their respective Makefiles.
+Commands (run from the repository root):
+
+```sh
+make                 # Build Core: build/bin/mcp-core
+make test            # Build and run the Core test suite
+make test-agent      # Run orchestrator/planner/validator tests
+make test-nakama     # Run the NakamaAgentTransport integration fixture
+make test-plugins    # Run plugin ABI and PluginManager tests
+make plugins         # Build existing hardware/system/Nakama plugins
+make info            # Show compiler and build inventory
+make clean           # Remove the generated build/ directory
+```
+
+Core objects, libraries, executables, test binaries and test-only plugin
+fixtures are staged under `build/`. The test runner uses an isolated working
+directory so tests that expect `core/tests/plugins` do not overwrite or
+depend on generated files in the source tree.
+
+Plugin Makefiles remain authoritative for their own dependencies and
+outputs. Building a plugin does not install or deploy it. Deployment,
+service restart and replacement of an installed plugin are separate,
+explicit operations.
 
 ## Tests
 

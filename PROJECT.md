@@ -51,7 +51,7 @@ La regla de diseño es mantener un **Core pequeño, autónomo y seguro**, con ca
 | PostgreSQL / pgvector / RAG | Planificado |
 | Plugins Network / Security / Services | Planificados como plugins completos |
 | `mcpctl` / Control Center | Planificados |
-| Build y despliegue reproducibles de todo el árbol | Pendiente de consolidación |
+| Build reproducible de Core y compilación de plugins | Makefiles BSD implementados; despliegue reproducible sigue pendiente |
 | Auditoría y release final | Pendiente |
 
 No se asigna un porcentaje global artificial: el avance se mide por subsistema y por pruebas verificables.
@@ -601,6 +601,29 @@ Estado observado en el host:
 - Archivo propiedad de `mcp`, modo `0600`.
 - El loader aplica validaciones estrictas de tamaño, tipo, propiedad, permisos, estructura JSON y URL/TLS.
 - No mostrar ni versionar el contenido secreto del archivo.
+
+### Build de MCP Core en FreeBSD
+
+El repositorio dispone de Makefiles nativos BSD make en la raíz y en `core/`.
+El Makefile raíz construye Core y delega los plugins a sus Makefiles propios,
+sin sustituirlos ni modificar sus reglas.
+
+Comandos desde la raíz:
+
+- `make`: compila `build/bin/mcp-core`.
+- `make test`: compila y ejecuta los tests de Core.
+- `make test-agent`: ejecuta las pruebas del Orchestrator, Planner y Validator.
+- `make test-nakama`: ejecuta la integración local de `NakamaAgentTransport`
+  mediante un plugin fixture aislado.
+- `make test-plugins`: ejecuta pruebas ABI y PluginManager.
+- `make plugins`: compila hardware, system y Nakama.
+- `make clean`: elimina únicamente el árbol generado `build/`.
+
+Los objetos, biblioteca estática, ejecutable, binarios de test y fixtures
+se generan bajo `build/`. Los fixtures se aíslan del directorio
+`core/tests/plugins` del código fuente. La compilación no implica instalación
+ni despliegue; reemplazar bibliotecas instaladas o reiniciar servicios
+requiere un procedimiento separado y autorizado.
 
 ### Nota sobre versiones desplegadas
 
