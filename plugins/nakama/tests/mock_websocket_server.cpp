@@ -21,7 +21,7 @@ namespace {
 
 constexpr int POLL_INTERVAL_MS = 100;
 constexpr std::size_t MAX_HTTP_HEADER = 16384;
-constexpr std::size_t MAX_FRAME_SIZE = 1024 * 1024;
+constexpr std::size_t MAX_FRAME_SIZE = 4 * 1024 * 1024;
 
 bool send_all(int fd, const void* data, std::size_t length)
 {

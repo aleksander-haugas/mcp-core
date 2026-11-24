@@ -2,13 +2,13 @@
 #include "nakama/websocket_transport.hpp"
 #include "nakama/receive_dispatcher.hpp"
 #include "nakama/http_auth.hpp"
+#include "nakama/agent_relay.hpp"
 
 #include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <atomic>
-#include <deque>
 #include <cstring>
 #include <new>
 #include <string>
@@ -616,8 +616,6 @@ struct NakamaPluginContext {
 
     // Temporary: used by the legacy receive path until dispatcher integration.
 
-    // Protects messages waiting for future Agent Bus handling.
-    std::mutex messages_mutex;
 
     // Protects the last reported transport or authentication error.
     std::mutex error_mutex;
@@ -631,7 +629,6 @@ struct NakamaPluginContext {
 
     std::string jwt;
     std::string last_error;
-    std::deque<nakama::WebSocketMessage> pending_messages;
 };
 
 std::shared_ptr<nakama::WebSocketTransport> get_transport(
@@ -890,7 +887,7 @@ void nakama_async_receiver(
         return;
     }
 
-    constexpr size_t MAX_AGENT_MESSAGE_SIZE = 1024 * 1024;
+    constexpr size_t MAX_AGENT_MESSAGE_SIZE = 4 * 1024 * 1024;
     constexpr size_t MAX_WEBSOCKET_MESSAGE_SIZE = 4 * 1024 * 1024;
 
     if (data == nullptr ||
@@ -1085,10 +1082,67 @@ bool start_receive_dispatcher(
                     return;
                 }
 
-                std::lock_guard<std::mutex> lock(context->messages_mutex);
+                try {
+                    nakama::AgentRelayMessage relay;
+                    std::string relay_error;
 
-                if (context->pending_messages.size() < 256) {
-                    context->pending_messages.push_back(message);
+                    const nakama::AgentRelayStatus relay_status =
+                        nakama::parse_agent_relay_event(
+                            message,
+                            relay,
+                            relay_error
+                        );
+
+                    if (relay_status == nakama::AgentRelayStatus::IGNORED) {
+                        return;
+                    }
+
+                    if (relay_status == nakama::AgentRelayStatus::INVALID) {
+                        set_last_error_noexcept(
+                            context,
+                            relay_error.empty() ? "Invalid Nakama Agent relay" : relay_error
+                        );
+                        return;
+                    }
+
+                    if (context == nullptr ||
+                        context->host == nullptr ||
+                        context->host->host_context == nullptr ||
+                        context->async_messages == nullptr ||
+                        context->async_messages->publish_authenticated == nullptr) {
+                        set_last_error_noexcept(
+                            context,
+                            "Authenticated asynchronous messaging ABI is unavailable"
+                        );
+                        return;
+                    }
+
+                    mcp_authenticated_message_context authenticated_context{
+                        sizeof(mcp_authenticated_message_context),
+                        MCP_PLUGIN_AUTHENTICATED_MESSAGE_CONTEXT_VERSION_1,
+                        "nakama",
+                        relay.authenticated_principal.c_str()
+                    };
+
+                    const mcp_plugin_status publish_status =
+                        context->async_messages->publish_authenticated(
+                            context->host->host_context,
+                            &authenticated_context,
+                            reinterpret_cast<const uint8_t*>(relay.envelope.data()),
+                            relay.envelope.size()
+                        );
+
+                    if (publish_status != MCP_PLUGIN_OK) {
+                        set_last_error_noexcept(
+                            context,
+                            "Core rejected authenticated Nakama Agent message"
+                        );
+                    }
+                } catch (...) {
+                    set_last_error_noexcept(
+                        context,
+                        "Unexpected error processing Nakama Agent relay"
+                    );
                 }
             },
             [context](const std::string& dispatcher_error) {
@@ -1732,12 +1786,6 @@ mcp_plugin_status execute_tool(
 
                         context->jwt.clear();
 
-                        {
-                            std::lock_guard<std::mutex> messages_lock(
-                                context->messages_mutex
-                            );
-                            context->pending_messages.clear();
-                        }
 
                         clear_last_error(context);
 
@@ -2156,12 +2204,6 @@ mcp_plugin_status execute_tool(
 
                     context->jwt.clear();
 
-                    {
-                        std::lock_guard<std::mutex> messages_lock(
-                            context->messages_mutex
-                        );
-                        context->pending_messages.clear();
-                    }
 
                     clear_last_error(context);
 

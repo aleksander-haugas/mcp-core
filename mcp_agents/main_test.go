@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -341,6 +342,69 @@ func TestValidIdentifierMatchesByteBasedCppRules(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := validIdentifier(tc.value); got != tc.valid {
 				t.Fatalf("validIdentifier() = %v, want %v", got, tc.valid)
+			}
+		})
+	}
+}
+
+func TestEncodeAgentRelay(t *testing.T) {
+	envelope := `{"protocol":"agent","version":1,"message_id":"test-1"}`
+
+	encoded, err := encodeAgentRelay("authenticated-user", "authenticated-session", envelope)
+	if err != nil {
+		t.Fatalf("encodeAgentRelay() error: %v", err)
+	}
+
+	var relay agentRelay
+	if err := json.Unmarshal([]byte(encoded), &relay); err != nil {
+		t.Fatalf("decode relay: %v", err)
+	}
+
+	if relay.Protocol != "mcp_agents_relay" || relay.Version != 1 {
+		t.Fatalf("unexpected relay protocol/version: %q/%d", relay.Protocol, relay.Version)
+	}
+	if relay.UserID != "authenticated-user" || relay.SessionID != "authenticated-session" {
+		t.Fatal("authenticated identity was not preserved")
+	}
+
+	var got, want interface{}
+	if err := json.Unmarshal(relay.Envelope, &got); err != nil {
+		t.Fatalf("decode inner envelope: %v", err)
+	}
+	if err := json.Unmarshal([]byte(envelope), &want); err != nil {
+		t.Fatalf("decode expected envelope: %v", err)
+	}
+
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("inner envelope changed: got %s, want %s", gotJSON, wantJSON)
+	}
+}
+
+func TestEncodeAgentRelayRejectsInvalidInput(t *testing.T) {
+	valid := `{"protocol":"agent","version":1}`
+
+	cases := []struct {
+		name      string
+		userID    string
+		sessionID string
+		payload   string
+	}{
+		{"empty user", "", "session", valid},
+		{"empty session", "user", "", valid},
+		{"oversized user", strings.Repeat("u", maxIdentifierSize+1), "session", valid},
+		{"oversized session", "user", strings.Repeat("s", maxIdentifierSize+1), valid},
+		{"empty envelope", "user", "session", ""},
+		{"invalid JSON", "user", "session", `{"broken":`},
+		{"oversized envelope", "user", "session",
+			`{"data":"` + strings.Repeat("x", maxMessageSize) + `"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := encodeAgentRelay(tc.userID, tc.sessionID, tc.payload); err == nil {
+				t.Fatal("invalid relay input was accepted")
 			}
 		})
 	}

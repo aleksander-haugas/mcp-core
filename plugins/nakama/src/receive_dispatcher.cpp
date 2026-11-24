@@ -3,6 +3,7 @@
 #include <json-c/json.h>
 
 #include <cstring>
+#include <climits>
 #include <exception>
 #include <utility>
 
@@ -36,14 +37,18 @@ std::string state_error(
     return "Unknown WebSocket transport state";
 }
 
-bool extract_pong_cid(
+bool extract_response_cid(
     const WebSocketMessage& message,
     std::string& cid)
 {
+    constexpr std::size_t MAX_RESPONSE_SIZE = 4 * 1024 * 1024;
+    constexpr std::size_t MAX_CID_SIZE = 256;
+
     if (message.type != WebSocketMessageType::TEXT ||
         message.payload.empty() ||
+        message.payload.size() > MAX_RESPONSE_SIZE ||
         message.payload.size() >
-            static_cast<std::size_t>(1024 * 1024)) {
+            static_cast<std::size_t>(INT_MAX)) {
         return false;
     }
 
@@ -94,22 +99,50 @@ bool extract_pong_cid(
 
     json_object* cid_object = nullptr;
     json_object* pong_object = nullptr;
+    json_object* rpc_object = nullptr;
+    json_object* error_object = nullptr;
 
-    const bool valid =
+    const bool root_valid =
         json_object_is_type(root, json_type_object) &&
         json_object_object_get_ex(root, "cid", &cid_object) &&
         cid_object != nullptr &&
-        json_object_is_type(cid_object, json_type_string) &&
+        json_object_is_type(cid_object, json_type_string);
+
+    const bool has_pong =
         json_object_object_get_ex(root, "pong", &pong_object) &&
         pong_object != nullptr &&
         json_object_is_type(pong_object, json_type_object);
+
+    const bool has_rpc =
+        json_object_object_get_ex(root, "rpc", &rpc_object) &&
+        rpc_object != nullptr &&
+        json_object_is_type(rpc_object, json_type_object);
+
+    const bool has_error =
+        json_object_object_get_ex(root, "error", &error_object) &&
+        error_object != nullptr &&
+        json_object_is_type(error_object, json_type_object);
+
+    const unsigned int response_count =
+        static_cast<unsigned int>(has_pong) +
+        static_cast<unsigned int>(has_rpc) +
+        static_cast<unsigned int>(has_error);
+
+    const bool response_valid = root_valid && response_count == 1;
+
+    bool valid = response_valid;
 
     if (valid) {
         const char* value = json_object_get_string(cid_object);
         const int length = json_object_get_string_len(cid_object);
 
-        if (value != nullptr && length > 0 &&
-            std::strlen(value) == static_cast<std::size_t>(length)) {
+        valid =
+            value != nullptr &&
+            length > 0 &&
+            static_cast<std::size_t>(length) <= MAX_CID_SIZE &&
+            std::strlen(value) == static_cast<std::size_t>(length);
+
+        if (valid) {
             cid.assign(value, static_cast<std::size_t>(length));
         }
     }
@@ -376,7 +409,7 @@ void ReceiveDispatcher::dispatch_message(WebSocketMessage message)
 {
     std::string cid;
 
-    if (extract_pong_cid(message, cid) &&
+    if (extract_response_cid(message, cid) &&
         resolve_pending(cid, message)) {
         return;
     }

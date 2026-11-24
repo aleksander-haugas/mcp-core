@@ -241,17 +241,18 @@ int main(int argc, char** argv)
     );
 
     check(
-        tools != nullptr && tool_count == 3,
-        "Exactly three tools are registered"
+        tools != nullptr && tool_count == 4,
+        "Exactly four tools are registered"
     );
 
     const char* expected_names[] = {
+        "nakama_connect",
         "nakama_status",
         "nakama_ping",
         "nakama_disconnect"
     };
 
-    bool definitions_valid = tools != nullptr && tool_count == 3;
+    bool definitions_valid = tools != nullptr && tool_count == 4;
 
     if (definitions_valid) {
         for (size_t i = 0; i < tool_count; ++i) {
@@ -270,26 +271,32 @@ int main(int argc, char** argv)
         "Tool names, descriptions and JSON schemas are valid"
     );
 
-    if (tools != nullptr && tool_count == 3) {
+    if (tools != nullptr && tool_count == 4) {
         check(
-            has_capability(tools[0], "nakama.read"),
-            "nakama_status requires nakama.read"
+            has_capability(tools[0], "nakama.control"),
+            "nakama_connect requires nakama.control"
         );
 
         check(
             has_capability(tools[1], "nakama.read"),
+            "nakama_status requires nakama.read"
+        );
+
+        check(
+            has_capability(tools[2], "nakama.read"),
             "nakama_ping requires nakama.read"
         );
 
         check(
-            has_capability(tools[2], "nakama.control"),
+            has_capability(tools[3], "nakama.control"),
             "nakama_disconnect requires nakama.control"
         );
 
         check(
             tools[0].required_capabilities_count == 1 &&
             tools[1].required_capabilities_count == 1 &&
-            tools[2].required_capabilities_count == 1,
+            tools[2].required_capabilities_count == 1 &&
+            tools[3].required_capabilities_count == 1,
             "Each tool declares exactly one capability"
         );
     }
@@ -377,8 +384,8 @@ int main(int argc, char** argv)
     check(
         status == MCP_PLUGIN_OK &&
         has_json_boolean(disconnect_buffer.data(), "disconnected", true) &&
-        has_json_boolean(disconnect_buffer.data(), "already_stopped", true),
-        "Disconnect reports already-stopped state"
+        has_json_boolean(disconnect_buffer.data(), "was_connected", false),
+        "Disconnect reports disconnected and previously stopped state"
     );
 
     size_t small_size = 1;
@@ -407,9 +414,26 @@ int main(int argc, char** argv)
         &ping_size
     );
 
+    std::vector<char> ping_buffer(ping_size, '\0');
+    size_t ping_capacity = ping_buffer.size();
+
+    status = execute(
+        context,
+        "nakama_ping",
+        "{}",
+        ping_buffer.data(),
+        &ping_capacity
+    );
+
     check(
-        status == MCP_PLUGIN_NOT_SUPPORTED,
-        "nakama_ping reports NOT_SUPPORTED before transport setup"
+        status == MCP_PLUGIN_OK && valid_json(ping_buffer.data()),
+        "nakama_ping returns a valid disconnected response"
+    );
+
+    check(
+        status == MCP_PLUGIN_OK &&
+        has_json_boolean(ping_buffer.data(), "pong", false),
+        "nakama_ping reports pong false when disconnected"
     );
 
     size_t invalid_size = 0;
